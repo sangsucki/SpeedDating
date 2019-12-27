@@ -1,0 +1,689 @@
+---
+title: "Stat Final"
+author: "Sangseok Lee"
+date: "11/18/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lattice)
+library(mice)
+library(VIM)
+library(tidyverse)
+library(dplyr)
+library(arm)
+library(pROC)
+library(e1071)
+library(caret)
+library(lme4)
+library(rstan)
+
+```
+
+## Intro
+
+In today’s busy world, finding and dating a romantic partner seems more time consuming than ever. As a result, many people have turned to speed dating as a solution that allows one to meet a large number of potential partners during a short amount of time. In this report, I want to explore what speed dating takes to become successful in getting approvals from a potential partner. In addition, since matching is more important than just decision, 
+I am going to explore what factors really affect their matching. 
+
+## Data 
+1. Decision model by male and female: I would like to know which variables are the main factors to make people choose. 
+2. Matching model by male and female : I would like to know which variables are the main factors to make people choose each other.
+
+In order to answer the first question, I use the dataset with 8378 rows and 15 columns and my response variable would be 'dec'variable. In addition, to answer the second question, I only select the people who decide their partner, which brings the dataset with 3375 rows and 23 columns. My response variable for the second model is 'match' variable. 
+
+
+```{r, include=FALSE}
+#read data
+dating <-read.csv("/Users/josephlee/myproject/Speed_Dating/0_data/Speed_Dating_Data.csv", sep = ",", header = TRUE)
+
+# first subset for selecting (one way)
+dating1<- subset(dating, select = c('iid','wave', 'pid','dec','gender','attr','sinc','intel','fun','amb',
+'shar','samerace','age_o','prob','like'))
+summary(dating1)
+#there are 10 NAs in pid column from wave 5, and they should not be deleted since they give information. I give 118 because only this iid was not evaluated by other partners.
+
+
+dating_na<-dating1 %>% filter(is.na(pid))
+dating1$pid[is.na(dating1$pid)] <- 118
+
+#remove rows when all 6 attributes are NAs : 192 variables 
+#dating2 <- subset(dating1, !is.na(dating1$attr) & !is.na(dating1$sinc) & !is.na(dating1$intel) & !is.na(dating1$fun) & !is.na(dating1$amb) & !is.na(dating1$shar))
+
+# remove 104 NAs from age_o since we have no clue 
+dating2 <- dating1 %>% filter(!is.na(age_o))
+# remove 295 NAs from prob since we have no clue
+dating2 <- dating2 %>% filter(!is.na(prob))
+# remove 15 NAs from like since we have no clue
+dating2 <- dating2 %>% filter(!is.na(like))
+summary(dating2)
+
+# remove 5 rows with all NAs
+cnt_na <- apply(dating2, 1, function(z) sum(is.na(z)))
+dating3 <- dating2[cnt_na < 6,]
+
+
+
+#summary(dating2)
+#to see all rows with any NAs
+#d <- dating1[is.na(dating1$attr) & is.na(dating1$sinc) &  is.na(dating1$fun) & is.na(dating1$amb) & is.na(dating1$shar), ]
+
+
+#d <- dating2[is.na(dating2$attr) & is.na(dating2$sinc) &  is.na(dating2$fun) & is.na(dating2$amb) & is.na(dating2$shar) , ]
+
+#change factor variable
+str(dating3)
+dating3$dec <- factor(dating3$dec)
+dating3$gender <- factor(dating3$gender)
+dating3$samerace <- factor(dating3$samerace)
+
+summary(dating3)
+
+
+
+```
+## 1-1. First model for the first question
+My response variable is 'dec' column and predictors are 11 variables: 'gender','attr','sinc','intel','fun','amb','shar','samerace','age_o','prob','like'. 
+
+# 1) Data Cleaning : missing values
+Frist of all, there are 10 NAs in pid(partner ID) column from wave 5, and they can be inferred as 118 because people in wave 5 evaluated everyone except 118 as iid. 
+Second, I dropped 414 rows including missing values that we cannot estimate from 'age_0', 'prob', 'like' columns. 5 no evaluation rows on all six variables(attr,sinc,intel,fun,amb,shar) is also removed because they do not give us any information for the decision. Third, we changed dec(decision), gender, samerace columns as facor variables. Still, we have about 1,000 missing values(about 15% of the dataset).
+
+```{r, echo= FALSE}
+#md.pattern(dating3)
+#filter each columns
+#dating_n <- dating2 %>% filter(is.na(attr) &is.na(shar)&is.na(sinc)& is.na(intel)& is.na(fun)& is.na(amb))
+#dating_n <- dating2 %>% filter(is.na(attr))
+#dating_n <- dating_n %>% filter(!is.na(shar))
+#dating_n <- dating_n %>% filter(!is.na(sinc))
+#dating_n <- dating_n %>% filter(!is.na(intel))
+#dating_n <- dating_n %>% filter(!is.na(fun))
+#dating_n <- dating_n %>% filter(!is.na(amb))
+
+
+aggr(dating3,col=c("lightblue3","darkred"),numbers=TRUE,sortVars=TRUE,labels=names(dating1),cex.axis=.7,gap=3,ylab=c("Proportion missing","Missingness pattern"))
+
+# marginplot(dating3[,c("shar","dec")],col=c("lightblue3","darkred"),cex.numbers=1.2,pch=19)
+```
+
+
+#2) Data  Cleaning : imputed data 
+Since some variables such as sinc, intel, amb and shar are relatively hard to estimate with imputed data compared with other variables such as attr and fun, I used two ways for imputation. 
+1. Imputation only for attr, fun (removal for NAs in sinc, intel, amb and shar)
+2. Imputation for every missing values in all six variables
+I am going to compare two models and decide which model is better. From the first way of imputation, I used 'pmm' because imputed values keeps observed values rathers than 'norm' way
+
+In order to avoid multi-collinearity, I made mean-centering for attr, sinc, intel, fun, amb, shar, prob, like. Now I divded this dataset by two : male and female. 
+
+```{r}
+
+# 1. Impute appearance and fun , remove other attributes that are less likely to figure out druing 4 minutes.
+dating_n <- dating3 %>% filter(!is.na(sinc))
+dating_n <- dating_n %>% filter(!is.na(shar))
+dating_n <- dating_n %>% filter(!is.na(intel))
+dating_n <- dating_n %>% filter(!is.na(amb))
+summary(dating_n)
+
+#we use pmm because imputed values keeps observed values
+dating_n_imp <- mice(dating_n,m=1,defaultMethod=c("norm","logreg","polyreg","polr"),print=F)
+n1 <- mice::complete(dating_n_imp)
+
+stripplot(dating_n_imp, col=c("grey","darkred"),pch=c(1,20))
+densityplot(dating_n_imp)
+
+n1$attr_c = n1$attr - mean(n1$attr)
+n1$sinc_c = n1$sinc - mean(n1$sinc)
+n1$intel_c = n1$intel - mean(n1$intel)
+n1$fun_c = n1$fun - mean(n1$fun)
+n1$amb_c = n1$amb - mean(n1$amb)
+n1$shar_c = n1$shar - mean(n1$shar)
+n1$prob_c = n1$prob - mean(n1$prob)
+n1$like_c = n1$like - mean(n1$like)
+
+# we analyze data by sex 
+n1_m <- n1[n1$gender=='1',] 
+n1_f <- n1[n1$gender=='0',] 
+
+```
+# 3 EDA
+
+
+
+```{r}
+#EDA for first model 
+
+# for different sex
+#female prefers to say yes when partner is attractive compared to male?
+qplot(x=dec,y=attr,data=n1, facets = ~gender, xlab="decision",ylab="attractive",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=sinc,data=n1, facets = ~gender,xlab="decision",ylab="sincere",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=intel,data=n1, facets = ~gender,xlab="decision",ylab="intelligent",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=fun,data=n1, facets = ~gender,xlab="decision",ylab="fun",
+      geom="boxplot",fill=dec)
+#female has no preference on ambitious given 4 minute. 
+qplot(x=dec,y=amb,data=n1, facets = ~gender,xlab="decision",ylab="ambitious",
+      geom="boxplot",fill=dec)
+#male prefer on sharing value compared to female
+qplot(x=dec,y=shar,data=n1, facets = ~gender,xlab="decision",ylab="sharing value",
+      geom="boxplot",fill=dec)
+#male prefer young partners? 
+qplot(x=dec,y=age_o,data=n1, facets = ~gender,xlab="decision",ylab="age of partner",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=prob,data=n1, facets = ~gender,xlab="decision",ylab="yes probability of partner",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=like,data=n1, facets = ~gender,xlab="decision",ylab="how much do you like",
+      geom="boxplot",fill=dec)
+
+
+#Check interaction term
+
+# it seems that there are interaction terms between intelligent and sharing values
+qplot(x = intel, y = shar, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+# it seems that there are interaction terms between ambitious and sharing values
+qplot(x = amb, y = shar, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+
+qplot(x = fun, y = shar, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+
+qplot(x = sinc, y = shar, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+qplot(x = prob, y = like, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+qplot(x = attr, y = shar, facets = ~gender, data = n1) +
+  geom_smooth(method = "lm")
+
+#no difference for samerace in male or female
+table(n1_m[,c("dec","samerace")])/sum(table(n1_m[,c("dec","samerace")]))
+table(n1_f[,c("dec","samerace")])/sum(table(n1_f[,c("dec","samerace")]))
+
+
+
+```
+
+```{r}
+# seeing difference betwen dec and attr divided by wave
+# Choose group = 1, 3, 4, 6, 9, 10, 11, 13,  16, 17
+
+set.seed(1000)
+group <- sample(1:21,10, replace= F)
+group
+
+n1_m_sample = n1_m %>% filter(wave %in% group)
+head(n1_m_sample)
+ggplot(n1_m_sample,aes(x=dec, y=attr)) +
+  geom_point(alpha = .5,colour="blue4") +
+  geom_smooth(method="lm",col="red3") +
+  labs(title="dec vs attr") +
+  facet_wrap(~wave,ncol=4)
+
+n1_f_sample = n1_f %>% filter(wave %in% group)
+head(n1_f_sample)
+ggplot(n1_f_sample,aes(x=dec, y=attr)) +
+  geom_point(alpha = .5,colour="blue4") +
+  geom_smooth(method="lm",col="red3") +
+  labs(title="dec vs attr") +
+  facet_wrap(~wave,ncol=4)
+
+
+
+```
+
+
+```{r}
+#Check raondom intercept and slope 
+nullmodel1 <- glmer( dec ~ 1 + (1|wave), data = n1, family=binomial(link="logit"))
+nullmodel2 <- glmer( dec ~ 1 + (attr|wave), data = n1, family=binomial(link="logit"))
+anova (nullmodel1, nullmodel2)
+```
+
+
+
+```{r}
+
+
+##1. For male
+# put everything together (AIC : 3153 , bic : 3239)
+dec_n1 <- glmer(dec~attr+sinc+intel+fun+amb+shar + samerace + age_o + prob+like + (attr|wave), family=binomial(link="logit"), data = n1_m)
+summary(dec_n1)
+
+
+#dec_n3 <- glmer(dec~attr_c+age_o +sinc_c+intel_c+fun_c+amb_c+shar_c + samerace + (attr|wave), family=binomial(link="logit"), data = train_m)
+#summary(dec_n3)
+
+# adding interaction term  (AIC: 3134 BIC : 3220)
+dec_m <- glmer(dec~attr_c+sinc_c+fun_c+amb_c+intel_c*shar_c  +samerace + prob_c+like_c + (attr|wave), family=binomial(link="logit"), data = n1_m)
+summary(dec_m)
+
+#coef(dec_m)
+
+#ln interpretation 
+
+anova (dec_n1, dec_m)
+
+dotplot(ranef(dec_m, condVar=TRUE)) 
+
+##2. For female
+
+# put everything together (AIC : 3166 , bic : 3258)
+dec_n1_f <- glmer(dec~ attr_c+sinc_c+fun_c+amb_c+intel_c*shar_c  +samerace + age_o+ prob_c+like_c+(attr|wave), family=binomial(link="logit"), data = n1_f)
+summary(dec_n1_f)
+
+# wihtout samerace and age (AIC: 3162 BIC : 3242)
+dec_f <- glmer(dec~ attr_c+sinc_c+fun_c+amb_c+intel_c*shar_c+ prob_c+like_c+(attr|wave), family=binomial(link="logit"), data = n1_f)
+summary(dec_f)
+
+
+```
+
+
+```{r}
+## 1. For male
+#confusion matrix
+
+Conf_mat <- confusionMatrix(as.factor(ifelse(fitted(dec_m) >= 0.5, "1","0")),
+                            as.factor(n1_m$dec),positive = "1")
+Conf_mat$table
+# accuracy: 0.8
+Conf_mat$overall["Accuracy"];
+Conf_mat$byClass[c("Sensitivity","Specificity")] 
+
+#Roc curve
+roc(n1_m$dec,fitted(dec_m),plot=T,print.thres="best",legacy.axes=T,
+    print.auc =T,col="red3")
+
+
+##2. For female
+Conf_mat2 <- confusionMatrix(as.factor(ifelse(fitted(dec_f) >= 0.5, "1","0")),
+                            as.factor(n1_f$dec),positive = "1")
+Conf_mat2$table
+#accuracy : 0.78
+Conf_mat2$overall["Accuracy"];
+Conf_mat2$byClass[c("Sensitivity","Specificity")] 
+
+#Roc curve
+roc(n1_f$dec,fitted(dec_f),plot=T,print.thres="best",legacy.axes=T,
+    print.auc =T,col="red3")
+```
+
+```{r}
+## 1. For male
+
+rawresid <- residuals(dec_m,"resp")
+#binned residual plots
+binnedplot(x=fitted(dec_m),y=rawresid,xlab="Pred. probabilities",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+binnedplot(n1_m$attr_c,y=rawresid,xlab="Attractive centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$sinc_c,y=rawresid,xlab="Sinceree centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$intel_c,y=rawresid,xlab="Inteligent centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$fun_c,y=rawresid,xlab="Fun centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$amb_c,y=rawresid,xlab="Ambitious centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$shar_c,y=rawresid,xlab="Sharing Values centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$prob_c,y=rawresid,xlab="Prob centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_m$like_c,y=rawresid,xlab="Like centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+##2. For female
+rawresid2 <- residuals(dec_f,"resp")
+#binned residual plots
+binnedplot(x=fitted(dec_f),y=rawresid2,xlab="Pred. probabilities",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+
+binnedplot(n1_f$attr_c,y=rawresid2,xlab="Attractive centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$sinc_c,y=rawresid2,xlab="sincere centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$intel_c,y=rawresid2,xlab="intelligent centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$fun_c,y=rawresid2,xlab="Fun centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$amb_c,y=rawresid2,xlab="ambitious centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$shar_c,y=rawresid2,xlab="Sharing Value centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$prob_c,y=rawresid2,xlab="Prob centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+binnedplot(n1_f$like_c,y=rawresid2,xlab="Like centered",
+           col.int="red4",ylab="Avg. residuals",main="Binned residual plot",col.pts="navy")
+```
+
+
+
+```{r}
+# 2. Since the first method loses 20% of data, I try to impute every variable instead 
+
+summary(dating3)
+dating3_imp <- mice(dating3,m=1,defaultMethod=c("pmm","logreg","polyreg","polr"),print=F)
+d2 <- mice::complete(dating3_imp)
+
+stripplot(dating3_imp, col=c("grey","darkred"),pch=c(1,20))
+
+#pmm looks better
+densityplot(dating3_imp)
+
+summary(d2)
+
+
+```
+
+
+
+
+
+
+```{r}
+#PART1 EDA 
+
+#female prefers to say yes when partner is attractive compared to male?
+qplot(x=dec,y=attr,data=d2, facets = ~gender, xlab="decision",ylab="attractive",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=sinc,data=d2, facets = ~gender,xlab="decision",ylab="sincere",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=intel,data=d2, facets = ~gender,xlab="decision",ylab="intelligent",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=fun,data=d2, facets = ~gender,xlab="decision",ylab="fun",
+      geom="boxplot",fill=dec)
+#female has no preference on ambitious given 4 minute. 
+qplot(x=dec,y=amb,data=d2, facets = ~gender,xlab="decision",ylab="ambitious",
+      geom="boxplot",fill=dec)
+#male prefer on sharing value compared to female
+qplot(x=dec,y=shar,data=d2, facets = ~gender,xlab="decision",ylab="sharing value",
+      geom="boxplot",fill=dec)
+#male prefer young partners? 
+qplot(x=dec,y=age_o,data=d2, facets = ~gender,xlab="decision",ylab="age of partner",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=prob,data=d2, facets = ~gender,xlab="decision",ylab="yes probability of partner",
+      geom="boxplot",fill=dec)
+qplot(x=dec,y=like,data=d2, facets = ~gender,xlab="decision",ylab="how much do you like",
+      geom="boxplot",fill=dec)
+
+
+#Check interaction term
+
+# it seems that there are interaction terms between intelligent and sharing values
+qplot(x = intel, y = shar, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+# it seems that there are interaction terms between ambitious and sharing values
+qplot(x = amb, y = shar, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+
+qplot(x = fun, y = shar, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+
+qplot(x = sinc, y = shar, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+qplot(x = prob, y = like, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+qplot(x = attr, y = shar, facets = ~gender, data = d2) +
+  geom_smooth(method = "lm")
+
+```
+
+```{r}
+#Mean centering
+d2$attr_c = d2$attr - mean(d2$attr)
+d2$sinc_c = d2$sinc - mean(d2$sinc)
+d2$intel_c = d2$intel - mean(d2$intel)
+d2$fun_c = d2$fun - mean(d2$fun)
+d2$amb_c = d2$amb - mean(d2$amb)
+d2$shar_c = d2$shar - mean(d2$shar)
+d2$prob_c = d2$prob - mean(d2$prob)
+d2$like_c = d2$like - mean(d2$like)
+
+# we analyze data by sex 
+d2_m <- d2[d2$gender=='1',] 
+d2_f <- d2[d2$gender=='0',] 
+
+
+#no difference for samerace in male or female
+table(d2_m[,c("dec","samerace")])/sum(table(d2_m[,c("dec","samerace")]))
+table(d2_f[,c("dec","samerace")])/sum(table(d2_f[,c("dec","samerace")]))
+
+```
+
+
+
+
+
+
+
+```{r}
+# For male 
+# same model with above (AIC : 3533, bic : 3621)
+dec2_m <- glmer(dec~attr_c+sinc_c+fun_c+amb_c+intel_c*shar_c  +samerace + prob_c+like_c + (attr|wave), family=binomial(link="logit"), data = d2_m)
+summary(dec2_m)
+
+#For female (AIC : 3722, BIC : 3803)
+
+dec2_f <- glmer(dec~ attr_c+sinc_c+fun_c+amb_c+intel_c*shar_c+ prob_c+like_c+(attr|wave), family=binomial(link="logit"), data = d2_f)
+summary(dec2_f)
+
+```
+
+
+```{r}
+#third subset for matching (both way)
+match1 <- subset(dating, select = c('iid','wave', 'pid','dec','match','gender','samerace','age_o','prob','like','attr3_1','sinc3_1','intel3_1','fun3_1','amb3_1','attr_o','sinc_o','intel_o','fun_o','amb_o','shar_o','prob_o','like_o'))
+
+
+#only concerning the people who decide to meet the opposite partner
+match1 <- match1 %>% filter(match1$dec==1)
+summary(match1)
+match1$pid[is.na(match1$pid)] <- 118
+#remove NAs for values that are hard to estimate
+match1 <- match1 %>% filter(!is.na(age_o))
+match1 <- match1 %>% filter(!is.na(prob))
+match1 <- match1 %>% filter(!is.na(like))
+match1 <- match1 %>% filter(!is.na(attr3_1))
+summary(match1)
+
+match2 <- match1 %>% filter(!is.na(shar_o))
+match2 <- match2 %>% filter(!is.na(amb_o))
+match2 <- match2 %>% filter(!is.na(intel_o))
+match2 <- match2 %>% filter(!is.na(sinc_o))
+match2 <- match2 %>% filter(!is.na(prob_o))
+match2 <- match2 %>% filter(!is.na(like_o))
+summary(match2)
+
+#change factor variable
+str(match2)
+
+match2$match <- factor(match2$match)
+match2$gender <- factor(match2$gender)
+match2$samerace <- factor(match2$samerace)
+
+```
+
+```{r}
+# I tried norm rather than pmm because it estimates stably
+match_imp <- mice(match2,m=1,defaultMethod=c("pmm","logreg","polyreg","polr"),print=F)
+m1 <- mice::complete(match_imp)
+
+stripplot(match_imp, col=c("grey","darkred"),pch=c(1,20))
+stripplot(match_imp, attr~.imp|match, col=c("grey","darkred"),pch=c(1,20))
+
+#pmm looks better
+densityplot(match_imp)
+
+summary(m1)
+
+
+```
+
+```{r}
+#PART1 EDA 
+
+qplot(x=match,y=age_o,data=m1, facets = ~gender, xlab="match",ylab="age of partner",
+      geom="boxplot",fill=match)
+qplot(x=match,y=prob,data=m1, facets = ~gender, xlab="match",ylab="probability to yes",
+      geom="boxplot",fill=match)
+qplot(x=match,y=prob_o,data=m1, facets = ~gender, xlab="match",ylab="partner's probability of yes",
+      geom="boxplot",fill=match)
+qplot(x=match,y=like,data=m1, facets = ~gender, xlab="match",ylab="like",
+      geom="boxplot",fill=match)
+qplot(x=match,y=like_o,data=m1, facets = ~gender, xlab="match",ylab="like of partner",
+      geom="boxplot",fill=match)
+qplot(x=match,y=attr3_1,data=m1, facets = ~gender, xlab="match",ylab="self attractive",
+      geom="boxplot",fill=match)
+qplot(x=match,y=sinc3_1,data=m1, facets = ~gender, xlab="match",ylab="self sincere",
+      geom="boxplot",fill=match)
+qplot(x=match,y=intel3_1,data=m1, facets = ~gender, xlab="match",ylab="self inteligent",
+      geom="boxplot",fill=match)
+# fun -> intersting 
+qplot(x=match,y=fun3_1,data=m1, facets = ~gender, xlab="match",ylab="self fun",
+      geom="boxplot",fill=match)
+qplot(x=match,y=amb3_1,data=m1, facets = ~gender, xlab="match",ylab="self ambitious",
+      geom="boxplot",fill=match)
+qplot(x=match,y=attr_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of attractive",
+      geom="boxplot",fill=match)
+qplot(x=match,y=sinc_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of sincere",
+      geom="boxplot",fill=match)
+qplot(x=match,y=intel_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of intel",
+      geom="boxplot",fill=match)
+qplot(x=match,y=fun_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of fun",
+      geom="boxplot",fill=match)
+qplot(x=match,y=amb_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of ambitious",
+      geom="boxplot",fill=match)
+qplot(x=match,y=shar_o,data=m1, facets = ~gender, xlab="match",ylab="partner's rating of share",
+      geom="boxplot",fill=match)
+
+#it does not make difference
+table(m1[,c("match","samerace")])/sum(table(m1[,c("match","samerace")]))
+
+
+#interaction term
+qplot(x = fun_o, y = fun3_1, facets = ~gender, data = m1) +
+  geom_smooth(method = "lm")
+qplot(x = attr_o, y = attr3_1, facets = ~gender, data = m1) +
+  geom_smooth(method = "lm")
+#no difference on sincere
+qplot(x = sinc_o, y = sinc3_1, facets = ~gender, data = m1) +
+  geom_smooth(method = "lm")
+qplot(x = intel_o, y = intel3_1, facets = ~gender, data = m1) +
+  geom_smooth(method = "lm")
+qplot(x = amb_o, y = fun3_1, facets = ~gender, data = m1) +
+  geom_smooth(method = "lm")
+
+basic_plot <- ggplot(m1,aes(x = fun_o, y = fun3_1, color = gender)) + theme_bw() 
+
+# Colored scatterplot
+basic_plot + geom_point(alpha = .3, size = .9) +geom_smooth(method = "lm")
+
+```
+
+
+
+
+
+```{r}
+# we analyze data by sex 
+m1_m <- m1[m1$gender=='1',] 
+m1_f <- m1[m1$gender=='0',] 
+
+
+
+##1. For male
+#stepwise for male
+NullModel = glm(match~1, data=m1_m, family=binomial)
+FullModel = glm(match~ attr3_1*attr_o+sinc3_1*sinc_o+intel3_1*intel_o+fun3_1*fun_o+amb3_1*amb_o + samerace + age_o + prob* like+prob_o*like_o+shar_o*intel_o, data=m1_m, family=binomial)
+stepwise_m=step(NullModel,scope=formula(FullModel),direction="both",trace=0)
+summary(stepwise_m)
+
+match_m <- glm(formula = match ~ like_o + attr_o + shar_o + prob + amb_o + fun_o + prob_o + sinc_o + intel_o + fun3_1 + like + shar_o:intel_o, family = binomial, data = m1_m)
+summary(match_m)
+exp(coef(match_m))
+
+
+# put everything together (AIC : 1471)
+match_m1 <- glm(match~attr3_1+sinc3_1+intel3_1+fun3_1+amb3_1 + samerace + age_o + prob* like+prob_o*like_o+attr_o+sinc_o+fun_o+amb_o+shar_o*intel_o, family=binomial(link="logit"), data = m1_m)
+summary(match_m1)
+
+
+##2. For female
+#stepwise for female
+NullModel1 = glm(match~1, data=m1_f, family=binomial)
+FullModel1 = glm(match~ attr3_1+sinc3_1+intel3_1+fun3_1+amb3_1 + samerace + age_o + prob* like+prob_o*like_o+attr_o+sinc_o+fun_o+amb_o+shar_o*intel_o, data=m1_f, family=binomial)
+stepwise_f=step(NullModel,scope=formula(FullModel),direction="both",trace=0)
+summary(stepwise_f)
+
+#best model (AIC: 1460)
+match_f <- glm(match ~ like_o + attr_o + shar_o + prob + amb_o + fun_o + prob_o + sinc_o + intel_o + fun3_1 + like + shar_o:intel_o, family = binomial, data = m1_f)
+summary(match_f)
+exp(coef(match_f))
+
+
+```
+using stepwise BIC , 
+
+
+
+```{r}
+## 1. For male
+#confusion matrix
+
+Conf_mat <- confusionMatrix(as.factor(ifelse(fitted(match_m) >= 0.5, "1","0")),
+                            as.factor(m1_m$match),positive = "1")
+Conf_mat$table
+# accuracy: 0.79
+Conf_mat$overall["Accuracy"];
+Conf_mat$byClass[c("Sensitivity","Specificity")] 
+
+#Roc curve
+roc(m1_m$match,fitted(match_m),plot=T,print.thres="best",legacy.axes=T,
+    print.auc =T,col="red3")
+
+
+##2. For female
+Conf_mat2 <- confusionMatrix(as.factor(ifelse(fitted(match_f) >= 0.386, "1","0")),
+                            as.factor(m1_f$match),positive = "1")
+Conf_mat2$table
+#accuracy : 0.79
+Conf_mat2$overall["Accuracy"];
+Conf_mat2$byClass[c("Sensitivity","Specificity")] 
+
+#Roc curve
+roc(m1_f$match,fitted(match_f),plot=T,print.thres="best",legacy.axes=T,
+    print.auc =T,col="red3")
+```
+
+hierarchical logistic equation 
+no issue with multicolinearity
+
+
+how to interpret correlation in logistic results 
+
+threshold? 
+prediction ? 
+
+
+Decision tree, random forest. ?
+
+
+
+
+
+
+#Limitation
+
+
+
+
+# Appendix 1 (Data)
+```{r}
+
+
+```
+```
+
+
